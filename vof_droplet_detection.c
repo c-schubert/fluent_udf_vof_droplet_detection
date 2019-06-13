@@ -3,7 +3,7 @@ UDF for droplet detection and localisation of phase areas in vof cases.
 
 
 Settings:
-	_PHASE_IDX : Phase index of detected phase
+	_PHASE_IDX : Phase index phase which should be detected
 	_MIN_VOL_FRAC : Lower Limit for detection
 
 
