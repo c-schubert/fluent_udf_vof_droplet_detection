@@ -1,5 +1,5 @@
 /*
-UDF for droplet detection and localisation of phase areas in Multiphase 
+UDF for continuos phase area detection (i.e. droplet detection) in Multiphase 
 VoF (Volume of Fluid) ANSYS Fluent cases.
 
 Settings:
@@ -9,17 +9,14 @@ Settings:
                            if 0 only over cell faces 
     _FLUID_  1 : Id of Fluid Domain
 
-WARNING: THIS IS AN EARLY VERSION THERE MAY BE UNEXPECTED BUGS!
+WARNING: THIS IS AN EARLY VERSION THERE MAY BE INEXPECTED BUGS!
 
-Ver: 0.4 (Christian Schubert)
-
-Current Limitations:
-- Only work in serial (but u could save data and run this function via 
-                        scheme script on saved *.dat files)
+Current Limitations & Todos:
 - Only double precision solver supported, due to file i/o
 
-TODO: Ver: 0.5 (planed)
-- parallel working version ...
+Ver: 0.5 (Christian Schubert)
+- parallel working version (but only over face detection on parallel boundaries)
+- several bug fixes
 
 Copyright 2019-2020 Christian Schubert
 
@@ -49,17 +46,19 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "sg_mphase.h"
 
 /* Settings */
-#define _PHASE_IDX 0            /* for phase to detect droplets of */
-#define _MIN_VOL_FRAC 0.01      /* Lower Limit for phase detection */
-#define _DETECT_OVER_EDGES 1
+#define _PHASE_IDX 0 /* for phase to detect droplets of */
+#define _MIN_VOL_FRAC 0.01 /* Lower Limit for phase detection */
+#define _DETECT_OVER_EDGES 0
 
 #define _FLUID_  1
 /* ------------------------------------------------------------------------- */
 
-#define _MYDEBUG 0
+#define _MYDEBUG 1
 #define STATE_OK 1
 #define STATE_ERROR 0
-#define _tol 1E-9
+#define MIN_UDMI 1
+#define UDMI_INT_TOL 1E-8
+#define STRLENMAX 50
 
 #define CELL_CHECKED 1
 #define NO_MAX_CELL_EDGE_NEIGHBOR_CELLS 80
@@ -82,7 +81,7 @@ int cfileexists(const char * filename){
 
 /* ------------------------------------------------------------------------- */
 
-struct Droplet
+struct Cpa
 {
     cell_t *cell_list;
     int    no_cells;
@@ -92,13 +91,15 @@ struct Droplet
     real   alpha_mean;
     real   mass;
     real   vol;
-    int     no_parboundary_cells;
-    cell_t  *parboundary_cell_list;
+    int     no_parboundary_faces;
+    face_t  *parboundary_faces_list;
     int    *boundary_id;
     int     no_boundaries;
+    char    **parboundary_name_list;
+    int     len_parboundary_name_list;
 };
 
-int initDroplet(struct Droplet *d, cell_t c)	/* Initialize struct for single droplet */	
+int initCpa(struct Cpa *d, cell_t c)	/* Initialize struct for single Cpa */	
 {
     int state = STATE_OK;
     int i;
@@ -127,8 +128,10 @@ int initDroplet(struct Droplet *d, cell_t c)	/* Initialize struct for single dro
         state = STATE_ERROR;
     }
 
-    (*d).no_parboundary_cells = 0;
-    (*d).parboundary_cell_list = NULL;
+    (*d).no_parboundary_faces = 0;
+    (*d).parboundary_faces_list = NULL;
+    (*d).parboundary_name_list = NULL;
+    (*d).len_parboundary_name_list = 0;
 
     (*d).boundary_id  = NULL;
     (*d).no_boundaries = 0;
@@ -136,7 +139,7 @@ int initDroplet(struct Droplet *d, cell_t c)	/* Initialize struct for single dro
     return state;
 }
 
-int dropletCellsAppend(struct Droplet *d, cell_t val)
+int cpaCellsAppend(struct Cpa *d, cell_t val)
 {
     int state = STATE_OK;
 
@@ -159,7 +162,7 @@ int dropletCellsAppend(struct Droplet *d, cell_t val)
 }
 
 
-void updateDropletWeights(struct Droplet *d, real c_mass, real x_c[ND_ND])	/* Update center of mass */
+void updateCpaWeights(struct Cpa *d, real c_mass, real x_c[ND_ND])	/* Update center of mass */
 {
     int i = 0;
 
@@ -169,10 +172,9 @@ void updateDropletWeights(struct Droplet *d, real c_mass, real x_c[ND_ND])	/* Up
     }
 }
 
-updateDropletBoundaryIDs(struct Droplet *d,Thread *tf)
+void updateCpaBoundaryFaceID_List(struct Cpa *d, Thread *tf)
 {
     int i = 0;
-    int j = 0;
     int boundary_id_used = 0;
     int boundary_face_id = THREAD_ID(tf);
 
@@ -185,15 +187,16 @@ updateDropletBoundaryIDs(struct Droplet *d,Thread *tf)
     }
     else
     {
-        for(j = 0; j<(*d).no_boundaries; j++)
+        for(i = 0; i<(*d).no_boundaries; i++)
         {
-            if(boundary_face_id == (*d).boundary_id[j])
+            if(boundary_face_id == (*d).boundary_id[i])
             {
                 boundary_id_used = 1;
+                break;
             }
         }
 
-        if(boundary_id_used == 0)
+        if(!boundary_id_used)
         {   
             (*d).no_boundaries ++;
             (*d).boundary_id =  (int*) realloc((*d).boundary_id, 
@@ -203,7 +206,81 @@ updateDropletBoundaryIDs(struct Droplet *d,Thread *tf)
     }
 }
 
-void setFinalDropletCOM(struct Droplet *d)
+
+void updateCpaParBoundaryFaceID_List(struct Cpa *d,face_t newfaceid)
+{
+    int i = 0;
+    int par_boundary_faceid_used = 0;
+
+
+    if((*d).no_parboundary_faces == 0)
+    {
+        (*d).parboundary_faces_list =  (int*) calloc(1, sizeof(int));
+        (*d).parboundary_faces_list[0] = newfaceid;
+        (*d).no_parboundary_faces ++;
+    }
+    else
+    {
+        for(i = 0; i<(*d).no_parboundary_faces; i++)
+        {
+            if(newfaceid == (*d).parboundary_faces_list[i])
+            {
+                par_boundary_faceid_used = 1;
+                break;
+            }
+        }
+
+        if(!par_boundary_faceid_used)
+        {   
+            (*d).no_parboundary_faces ++;
+            (*d).parboundary_faces_list =  (int*) realloc((*d).parboundary_faces_list, 
+                                    (*d).no_parboundary_faces*sizeof(int));
+            (*d).parboundary_faces_list[(*d).no_parboundary_faces-1] = newfaceid;
+        }
+    }
+}
+
+void updateParBoundaryNameList(struct Cpa *d, char pbname[])
+{
+    int i = 0;
+    int cur_len;
+    int par_boundary_name_used = 0;
+
+    if((*d).len_parboundary_name_list == 0)
+    {
+        (*d).parboundary_name_list =  (char**) malloc(1 * sizeof(char*));
+
+        (*d).parboundary_name_list[0] = (char*) malloc(STRLENMAX * sizeof(char));
+        strcpy((*d).parboundary_name_list[0], pbname);
+        (*d).len_parboundary_name_list ++;
+    }
+    else
+    {
+        for(i = 0; i<(*d).len_parboundary_name_list; ++i)
+        {
+            if(strcmp(pbname, (*d).parboundary_name_list[i]) == 0)
+            {
+                par_boundary_name_used = 1;
+                break;
+            } 
+        }
+
+        if(!par_boundary_name_used)
+        {
+            cur_len = (*d).len_parboundary_name_list;
+
+            (*d).parboundary_name_list =  (char**) realloc((*d).parboundary_name_list, 
+                                    (cur_len+1)*sizeof(char*));
+
+            (*d).parboundary_name_list[cur_len] = (char*) malloc(STRLENMAX * sizeof(char));
+            strcpy((*d).parboundary_name_list[cur_len], pbname);
+            (*d).len_parboundary_name_list ++; 
+        }
+    }
+}
+
+
+void setFinalCpaCOM(struct Cpa *d)
 {
     int i = 0;
 
@@ -213,7 +290,49 @@ void setFinalDropletCOM(struct Droplet *d)
     }
 }
 
-int printDList(char filesuffix[], struct Droplet *DList, int sizeDList)
+
+int printCpaCells(char filesuffix[], struct Cpa *DList, int sizeDList, Thread *ct)
+{
+    FILE *fd = NULL;
+    int state = STATE_OK;
+    int i,j;
+    char filename[100];
+
+    sprintf(filename, "%i_cells_%s", myid, filesuffix);
+
+    fd = fopen(filename, "a");
+
+    if(fd == NULL)
+    {
+        Message("Error (printCpas()): Unable to open file %s "
+                "for writing!\n", filename);
+        state = STATE_ERROR;
+    }
+    else
+    {
+        fprintf(fd, "{\n");
+        fprintf(fd, "%lf\n", CURRENT_TIME);
+        fprintf(fd,"cell_count[cells]\n");
+        for(i = 0; i < sizeDList; ++i)
+        {
+            fprintf(fd, "%i[", DList[i].no_cells);
+            for(j = 0; j <DList[i].no_cells; ++j)
+            {
+                fprintf(fd, "%li", (long) C_ID(DList[i].cell_list[j],ct));
+                if(j < (DList[i].no_cells -1))
+                {
+                    fprintf(fd, ", ");
+                }
+            }
+            fprintf(fd, "]]\n");
+        }
+        fprintf(fd, "}\n");
+    }
+    
+    return state;
+}
+
+int printCpas(char filesuffix[], struct Cpa *DList, int sizeDList)
 {
     FILE *fd = NULL;
     int state = STATE_OK;
@@ -226,7 +345,7 @@ int printDList(char filesuffix[], struct Droplet *DList, int sizeDList)
 
     if(fd == NULL)
     {
-        Message("Error (printDList()): Unable to open file %s "
+        Message("Error (printCpas()): Unable to open file %s "
                 "for writing!\n", filename);
         state = STATE_ERROR;
     }
@@ -251,28 +370,43 @@ int printDList(char filesuffix[], struct Droplet *DList, int sizeDList)
             fprintf(fd, "%lE,", DList[i].alpha_max);
 
             fprintf(fd, "[");
-            if(DList[i].no_boundaries > 0)
+            if(DList[i].no_boundaries > 0 || DList[i].len_parboundary_name_list >0)
             {
-                for(j = 0; j < (DList[i].no_boundaries-1); ++j)
+                for(j = 0; j < DList[i].no_boundaries; ++j)
                 {
-                    fprintf(fd, "%i,", DList[i].boundary_id[j]);
+                    fprintf(fd, "%i", DList[i].boundary_id[j]);
+
+                    if(j < (DList[i].no_boundaries -1) || DList[i].len_parboundary_name_list>0)
+                    {
+                        fprintf(fd, ",");
+                    }
                 }
-                fprintf(fd, "%i],", DList[i].boundary_id[DList[i].no_boundaries-1]);
+
+                for(j = 0; j < DList[i].len_parboundary_name_list; j++)
+                {
+                    fprintf(fd, "%s", DList[i].parboundary_name_list[j]);
+
+                    if(j < (DList[i].len_parboundary_name_list-1))
+                    {
+                        fprintf(fd, ",");
+                    }
+                }
+                fprintf(fd, "],");
             }
             else
             {
                 fprintf(fd, "],");
             }
 
-            fprintf(fd, "%i[", DList[i].no_parboundary_cells);
+            fprintf(fd, "%i[", DList[i].no_parboundary_faces);
 
-            if(DList[i].no_parboundary_cells > 0)
+            if(DList[i].no_parboundary_faces > 0)
             {
-                for(j = 0; j < (DList[i].no_parboundary_cells-1); ++j)
+                for(j = 0; j < (DList[i].no_parboundary_faces-1); ++j)
                 {
-                    fprintf(fd, "%i,", DList[i].parboundary_cell_list[j]);
+                    fprintf(fd, "%i,", DList[i].parboundary_faces_list[j]);
                 }
-                fprintf(fd, "%i]]\n",DList[i].parboundary_cell_list[DList[i].no_parboundary_cells-1]);
+                fprintf(fd, "%i]]\n",DList[i].parboundary_faces_list[DList[i].no_parboundary_faces-1]);
             }
             else
             {
@@ -380,6 +514,29 @@ int copyIntArray(int **toarr, int *fromarr, int arrsize)
 }
 
 
+int copyCharArrays(char ***toarr, char **fromarr, int arrsize, int chararrsize)
+{
+    int i;
+    int state = STATE_OK;
+
+    *toarr = (char **) malloc(arrsize * sizeof(char*));
+
+    if(*toarr != NULL) 
+    {
+        for(i = 0; i < arrsize; ++i)
+        {
+            (*toarr)[i] = (char*) malloc(chararrsize * sizeof(char));
+            strcpy((*toarr)[i], fromarr[i]);
+        }
+    }else 
+    {
+        DebugMessage("\nError: Kein freier Speicher für Copy Calloc vorhanden.\n");
+        state = STATE_ERROR;
+    }
+
+    return state;
+}
+
 /* ------------------------------------------------------------------------- */
 
 void resetIntArray(int *arr, int size, int val)
@@ -413,7 +570,7 @@ void getCellsFaceNeighborCells(
         f = C_FACE(c0,c0t,n);            /*return thread global face index*/
         tf = C_FACE_THREAD(c0,c0t,n);
 
-        if(tf != NULL && PRINCIPAL_FACE_P(f, tf) && !BOUNDARY_FACE_THREAD_P(tf))
+        if(tf != NULL && !BOUNDARY_FACE_THREAD_P(tf))
         {
             c0x = F_C0(f, tf);
             c1x = F_C1(f, tf);
@@ -427,10 +584,6 @@ void getCellsFaceNeighborCells(
                         cfncarr[i] = c1x;
                         i += 1;
                     }
-                    else
-                    {
-                        Message("Warning getCellsFaceNeighborCells(): Index out of bounds!");
-                    }
                 }
                 else if(c1x == c0)
                 {
@@ -438,10 +591,6 @@ void getCellsFaceNeighborCells(
                     {
                         cfncarr[i] = c0x;
                         i += 1;
-                    }
-                    else
-                    {
-                        Message("Warning getCellsFaceNeighborCells(): Index out of bounds!");
                     }
                 }	
             }
@@ -486,7 +635,6 @@ int countValinIntArray(int *arr, int arr_size, int val)
 int occursInCellArray(cell_t *arr, int arr_size, cell_t val)
 {
     int i;
-    int count = 0;
 
     for(i=0; i<arr_size; ++i)
     {
@@ -505,12 +653,11 @@ void getCellsEdgeNeighborCells(
                                 Thread *c0t,
                                 cell_t nocells_c0t,  
                                 cell_t *cencarr,
+                                int *cfnarr_size,
                                 int *cencarr_size
                                 )
 {
-    int i,j,n;
-    face_t f;
-    Thread *tf;
+    int i,j;
     cell_t ci;
 
     *cencarr_size = 0;
@@ -535,6 +682,8 @@ void getCellsEdgeNeighborCells(
             Message("Error getCellsEdgeNeighborCells(): Edge index going to high 1!\n");
         }
     }
+
+    *cfnarr_size = c0_cfncarr_size;
 
     for(i=0; i<c0_cfncarr_size; ++i)
     {   
@@ -562,39 +711,63 @@ void getCellsEdgeNeighborCells(
 }
 
 
+face_t getGlobalFaceBetweenCells(cell_t c0, cell_t c1, Thread *ct)
+{
+    cell_t c0f, c1f;
+    face_t f;
+    Thread *tf;
+    int n;
+
+    c_face_loop(c0, ct, n)
+    {
+        f = C_FACE(c0,ct,n);          
+        tf = C_FACE_THREAD(c0,ct,n);
+
+        if(tf != NULL)
+        {
+            c0f = F_C0(f, tf);
+            c1f= F_C1(f, tf);
+
+            if ((c0f == c0 && c1f == c1) || (c0f == c1 && c1f == c0))
+            {
+                    return F_ID(f,tf);
+            }
+        }
+    }
+
+    return -1;
+}
 /*----------------------------------------------------------------------------*/
 
 void cpa_detection()
 {
- /*
+/*
     
-    */
+*/
     #if !RP_HOST
     cell_t c, cx, ci;                 /*Cell index*/
     Domain *domain =Get_Domain(1);          /*Fluid domain*/
-     
+
     int state = STATE_OK;
-    Thread *t;
     Thread *ct;                             /*Cell Thread pointer*/
     Thread *tf;                             /*Face Thread pointer*/
     Thread **pt;
-    face_t f;                               /*Face index*/
+    face_t f, fid;
     int fluid_IDs[] = {_FLUID_};                
-    int boundaryCheck;
     real x_c[ND_ND];
-    real c_mass = 0;
-    int n;                                  /*Local face index number*/
-    int i;
+    real c_mass = 0;                               /*Local face index number*/
+    int i,j,n;
     int cci;
-    struct Droplet D;                       /*Single droplet*/
-    int dci;                                /*Droplet cell index*/	
-    int dfi;                                /*Cell face index*/	
+    struct Cpa D;                       /*Single Cpa*/
+    int dci;                                /*Cpa cell index*/	
     int nocells_ct = 0;
     int cell_count = 0;
     int *cell_checked_arr = NULL;           /*0=unchecked, 1=checked*/
-    struct Droplet *DList = NULL;           /*Droplet List (dynamic allocation)*/
-    int i_DList = 0;                        /* Current droplet index in droplet list */
-    int DList_length = 0;                   /*Number droplets in droplet list */
+    struct Cpa *DList = NULL;           /*Cpa List (dynamic allocation)*/
+    int i_DList = 0;                        /* Current Cpa index in Cpa list */
+    int DList_length = 0;                   /*Number Cpas in Cpa list */
+    int c0fnc_array_size;
+    char pbname[STRLENMAX];
 
     #if _DETECT_OVER_EDGES
     cell_t c0nc_array[NO_MAX_CELL_EDGE_NEIGHBOR_CELLS];  /*neighbor cells of c0*/
@@ -608,7 +781,7 @@ void cpa_detection()
     
 
     /* Count domain cells and initialize UDMI */
-
+    cell_count = 0;
     for (i = 0; i < no_fluid_IDs; i++)
     {
         ct = NULL;
@@ -616,15 +789,16 @@ void cpa_detection()
 
         if(ct != NULL)
         {
-            cell_count += THREAD_N_ELEMENTS(ct);
+            cell_count += THREAD_N_ELEMENTS_INT(ct);
+            cell_count += THREAD_N_ELEMENTS_EXT(ct);
         }
         else
         {
-            Message("Error DropletDetermination(): Cannot find fluid cell thread with id %i", fluid_IDs[i]);
+            Message("Error CpaDetermination(): Cannot find fluid cell thread with id %i", fluid_IDs[i]);
         }
         
     }
-  
+
     cell_checked_arr = (int*) calloc(cell_count,  sizeof(int));
     
     if(cell_checked_arr != NULL || cell_count == 0) 
@@ -637,7 +811,7 @@ void cpa_detection()
         state = STATE_ERROR;
     }
     
-    if(state == STATE_OK)
+    if(state == STATE_OK &&  N_UDM >= MIN_UDMI)
     {
         for (i = 0; i < no_fluid_IDs; i++)
         {
@@ -648,7 +822,8 @@ void cpa_detection()
 
             if(ct != NULL)
             {   
-                nocells_ct = THREAD_N_ELEMENTS(ct);
+                nocells_ct = THREAD_N_ELEMENTS_INT(ct);
+                nocells_ct += THREAD_N_ELEMENTS_EXT(ct);
 
                 begin_c_loop_int(c, ct)
                 {
@@ -666,13 +841,13 @@ void cpa_detection()
 
                     /* find initial droplet cell */
                     if (
-                           pt != NULL
+                        pt != NULL
                         && (cell_checked_arr[c] != CELL_CHECKED) 
                         && (C_VOF(c, pt[_PHASE_IDX]) > _MIN_VOL_FRAC)
                         && (state == STATE_OK)
                     )
                     {
-                        state = initDroplet(&D, c);
+                        state = initCpa(&D, c); /*Initital cpa (droplet)*/
                         DList_length++;
 
                         if (state == STATE_OK)
@@ -696,96 +871,115 @@ void cpa_detection()
                                     D.alpha_max = C_VOF(cx, pt[_PHASE_IDX]);
                                 }
 
-                                updateDropletWeights(&D, c_mass, x_c);
-
+                                updateCpaWeights(&D, c_mass, x_c);
+                            
                                 c_face_loop(cx, ct, n)
                                 {
                                     f = C_FACE(cx,ct,n); /*return thread global face index*/
                                     tf = C_FACE_THREAD(cx,ct,n); 
-
                                     
                                     if(tf != NULL && BOUNDARY_FACE_THREAD_P(tf))
                                     {
-                                        updateDropletBoundaryIDs(&D, tf);
+                                        updateCpaBoundaryFaceID_List(&D, tf);
                                     }
-        
-                                    /*
-                                        TODO: Detect faces of cell which are chared with other compute nodes.
-                                        Which is kind of difficult since Fluent shares some cells between the nodes
-                                        but as copy and PRINCIPAL_FACE_P between interior and regular exterior cells
-                                        is only occuring in "one side" of the node so I guess the mesh face is also copied.
-
-                                        One possibility would be to map faces on partiaion boundaries to each other and use only
-                                        the global face labels ...
-
-                                        Another possiblity could be to use some function from para.h to solve the problem ...
-                                        For example if there where macros to get corresponding face or cell ids from regular extended cells oder faces ...
-                                    */
                                 }
 
-                                if (cell_checked_arr[cx] != CELL_CHECKED)
+                                if (C_UDMI(cx,ct,0) > UDMI_INT_TOL) 
                                 {
-                                    setCellAsChecked(cell_checked_arr, cell_count, cx);
-                                
+                                    /*Partition Boundary interior cell*/
+                                    /*add cell boundary id to boundary list ...
+                                    currently only working for cell neighbors accross
+                                    compute node boundaries ...*/
                                     c0nc_array_size = 0;
-
-                                    #if _DETECT_OVER_EDGES
-                                    getCellsEdgeNeighborCells(cx, ct, nocells_ct, c0nc_array, &c0nc_array_size);
-                                    #else
                                     getCellsFaceNeighborCells(cx, ct, nocells_ct, c0nc_array, &c0nc_array_size);
-                                    #endif    
 
                                     for(cci=0; cci<c0nc_array_size; ++cci)
                                     {
                                         ci = c0nc_array[cci];
-                                        pt = THREAD_SUB_THREADS(ct);
 
-                                        if((cell_checked_arr[ci] != CELL_CHECKED)
-                                            && (C_VOF(ci, pt[_PHASE_IDX]) > _MIN_VOL_FRAC))
+                                        if (C_PART(ci, ct) != myid && C_VOF(ci, pt[_PHASE_IDX]) > _MIN_VOL_FRAC)
                                         {
-                                            state = dropletCellsAppend(&D, ci);
-                                        }
-                                        else
-                                        {
-                                            setCellAsChecked(cell_checked_arr, cell_count, ci);
+                                            fid = getGlobalFaceBetweenCells(cx, ci, ct);
+
+                                            if (fid != -1)
+                                            {
+                                                updateCpaParBoundaryFaceID_List(&D, fid);
+
+                                                sprintf(pbname, "procBoundary%ito%li", myid, (long) C_PART(ci, ct)); 
+                                                updateParBoundaryNameList(&D, pbname);
+                                            }
                                         }
                                     }
                                 }
+
+                                c0nc_array_size = 0;
+
+                                #if _DETECT_OVER_EDGES
+                                getCellsEdgeNeighborCells(cx, ct, nocells_ct, c0nc_array, &c0nc_array_size, &c0fnc_array_size);
+                                #else
+                                getCellsFaceNeighborCells(cx, ct, nocells_ct, c0nc_array, &c0nc_array_size);
+                                #endif    
+
+                                for(cci=0; cci<c0nc_array_size; ++cci)
+                                {
+                                    ci = c0nc_array[cci];
+                                    pt = THREAD_SUB_THREADS(ct);
+
+                                    if( (cell_checked_arr[ci] != CELL_CHECKED)
+                                        && (C_PART(ci, ct) == myid)
+                                        && (C_VOF(ci, pt[_PHASE_IDX]) > _MIN_VOL_FRAC
+                                        && (ci != cx)
+                                        )
+                                    )
+                                    {
+                                        state = cpaCellsAppend(&D, ci);
+                                        setCellAsChecked(cell_checked_arr, cell_count, ci);
+                                    }
+                                    else
+                                    {
+                                        setCellAsChecked(cell_checked_arr, cell_count, ci);
+                                    }
+                                }
+
+                                setCellAsChecked(cell_checked_arr, cell_count, cx);
                             }
 
                             D.alpha_mean = D.alpha_mean/D.no_cells;
 
-                            setFinalDropletCOM(&D);
+                            setFinalCpaCOM(&D);
 
                             if(DList_length == 0)
                             {
-                                DList = (struct Droplet*) calloc(DList_length, 
-                                                        sizeof(struct Droplet));
+                                DList = (struct Cpa*) calloc(DList_length, 
+                                                        sizeof(struct Cpa));
                             }
                             else
                             {
-                                DList = (struct Droplet*) realloc(DList, 
-                                        (DList_length) * sizeof(struct Droplet));  
+                                DList = (struct Cpa*) realloc(DList, 
+                                        (DList_length) * sizeof(struct Cpa));  
                             }
                                 
                             if(DList != NULL) 
                             {
                                 state = copyCell_tArray(&(DList[i_DList].cell_list),
                                             D.cell_list, D.no_cells);
-                                state = copyCell_tArray(&(DList[i_DList].parboundary_cell_list),
-                                            D.parboundary_cell_list, D.no_parboundary_cells);
+                                state = copyCell_tArray(&(DList[i_DList].parboundary_faces_list),
+                                            D.parboundary_faces_list, D.no_parboundary_faces);
                                 state = copyRealND_ND_Array(&(DList[i_DList].com), 
                                             D.com, ND_ND);
                                 state = copyIntArray(&(DList[i_DList].boundary_id),
                                             D.boundary_id, D.no_boundaries);
+                                state = copyCharArrays(&(DList[i_DList].parboundary_name_list),
+                                            D.parboundary_name_list, D.len_parboundary_name_list, STRLENMAX);
 
                                 DList[i_DList].no_boundaries = D.no_boundaries;       
                                 DList[i_DList].no_cells = D.no_cells;
-                                DList[i_DList].no_parboundary_cells = D.no_parboundary_cells;
+                                DList[i_DList].no_parboundary_faces = D.no_parboundary_faces;
                                 DList[i_DList].mass = D.mass;
                                 DList[i_DList].vol = D.vol;
                                 DList[i_DList].alpha_mean = D.alpha_mean;
                                 DList[i_DList].alpha_max = D.alpha_max;
+                                DList[i_DList].len_parboundary_name_list = D.len_parboundary_name_list;
                             }
                             else 
                             {
@@ -808,11 +1002,11 @@ void cpa_detection()
                 Message("Error DropletDetermination(): Cannot find fluid cell thread with id %i", fluid_IDs[i]);
             }
         } 
+        Message("Found %i cpas in myid %i.\n", DList_length, myid);
+        printCpas("cpa.txt", DList, DList_length);
+        /*printCpaCells("cpa.txt", DList, DList_length, ct); */ /*For debug only*/
     }
     
-    Message("Found %i cpas in myid %i.\n", DList_length, myid);
-    printDList("cpa.txt", DList, DList_length);
-
     /*Free Memory*/
     if(DList_length > 0)
     {
@@ -823,10 +1017,23 @@ void cpa_detection()
                 free(DList[i].cell_list);
             }
 
-            if(DList[i].parboundary_cell_list != NULL)
+            if(DList[i].parboundary_faces_list != NULL)
             {
-                free(DList[i].parboundary_cell_list);
+                free(DList[i].parboundary_faces_list);
             }
+
+            for(j=0;j<DList[i].len_parboundary_name_list;++j)
+            {
+                if(DList[i].parboundary_name_list[j] != NULL)
+                {
+                    free(DList[i].parboundary_name_list[j]);
+                }
+            }
+            
+            if(DList[i].parboundary_name_list != NULL)
+            {
+                free(DList[i].parboundary_name_list);
+            } 
 
         }
         if(DList != NULL)
@@ -846,15 +1053,94 @@ void cpa_detection()
 
 DEFINE_ON_DEMAND(CPAD_oD)
 {
-    #if !RP_HOST
-        cpa_detection();
-   #endif
+#if !RP_HOST
+    cpa_detection();
+#endif
 }
 
 
 DEFINE_EXECUTE_AT_END(CPAD_aE)
 {
+#if !RP_HOST
+    cpa_detection();
+#endif
+}
+
+
+DEFINE_ON_DEMAND(MARKPAR_oD)
+{
+#if !RP_HOST
+    markParBoundCells();
+#endif
+}
+
+
+void markParBoundCells()
+{
+
     #if !RP_HOST
-        cpa_detection();
-   #endif
+    int n, nocells_ct;
+    cell_t c, c1, c0;                           /*Cell index*/
+    Domain *domain =Get_Domain(1);          /*Fluid domain*/
+    Thread *ct;                             /*Cell Thread pointer*/
+    Thread *tf;                             /*Face Thread pointer*/
+    face_t f;                               /*Face index*/        
+
+    if(N_UDM > 0)
+    {
+        thread_loop_c(ct, domain) /*loops over all cell threads in domain*/
+        {                        
+            if(ct != NULL)
+            {   
+                nocells_ct = THREAD_N_ELEMENTS_EEXT(ct);
+                nocells_ct += THREAD_N_ELEMENTS_INT(ct);
+
+                begin_c_loop_ext(c, ct)
+                {
+                    C_UDMI(c,ct,0) = 0.0;
+                }end_c_loop_ext(c, ct)
+
+                begin_c_loop_ext(c, ct)
+                {
+                    c_face_loop(c, ct, n)
+                    {
+                        f = C_FACE(c,ct,n);            /*return thread global face index*/
+                        tf = C_FACE_THREAD(c,ct,n);
+
+                        if(tf != NULL)
+                        {
+                            c0 = F_C0(f, tf);
+                            c1= F_C1(f, tf);
+                            
+                            if (c0 == c)
+                            {   
+                                if(c1> 0 && c1< nocells_ct)
+                                {
+                                    if(C_PART(c1,ct) == myid)
+                                    {   
+                                        C_UDMI(c1,ct,0) = myid+1;
+                                    }
+                                }
+                            }
+                            else if(c1 == c)
+                            {
+                                if(c0 > 0 && c0 < nocells_ct)
+                                {
+                                    if(C_PART(c0,ct) == myid)
+                                    {   
+                                        C_UDMI(c0,ct,0) = myid+1;
+                                    }
+                                }
+                            }	
+                        }
+                    }
+                }end_c_loop_ext(c, ct)
+            }
+        }
+    }
+    else
+    {
+        Message("Not enough UDMI Memory!\n");
+    }
+    #endif
 }

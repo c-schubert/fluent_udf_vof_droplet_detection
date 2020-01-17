@@ -2,7 +2,8 @@
 UDF library for the detection and localization of separated continuos phase areas (for example droplets) in Multiphase VoF (Volume of Fluid) ANSYS Fluent cases.
 
 Currently Limitations:
-  - limited to serial double precision Fluent cases
+  - limited to double precision Fluent cases
+  - also works in parallel (but on the parallel partition boundary over edge detection will not work and fall back to over face detection ...)
 
 Settings:
 ``` cpp
@@ -22,3 +23,6 @@ Captured properties of separated continuos phase areas are:
   - average volume fraction
   - max volume fraction
   - connected boundary id's
+
+
+For reconstruction of parallel cpa files take a look at [of-cpad-library: Evaluation Scripts](https://github.com/c-schubert/of-cpad-library/tree/master/eval).
